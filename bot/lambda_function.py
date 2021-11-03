@@ -11,23 +11,6 @@ from boto3.dynamodb.conditions import Attr
 bot = telebot.TeleBot(bot_config.TELEGRAM_TOKEN, threaded=False)
 
 
-def notify_users():
-    for user in User.objects.all():
-        shares = get_user_shares(user['user_id'], change=True)
-
-        if not len(shares):
-            continue
-
-        total_change = sum([share['change'] for share in shares])
-
-        if total_change < 0:
-            response = f'Изменение стоимости активов: {total_change}'
-        else:
-            response = f'Изменение стоимости активов: +{total_change}'
-
-        bot.send_message(user['user_id'], response)
-
-
 def lambda_handler(message, context):
     try:
         if 'source' in message:
@@ -67,13 +50,51 @@ def start_handler(message):
     bot.send_message(user.id, bot_messages.start_message)
 
 
+@bot.message_handler(func=lambda message: True, commands=['help'])
+def help_command(message):
+    bot.send_message(message.from_user.id, bot_messages.help_command)
+
+
+@bot.message_handler(func=lambda message: True, commands=['my_investment_portfolio'])
+def my_investment_portfolio_command(message):
+    shares = get_user_shares(message.from_user.id)
+
+    total_price = sum([share['users_capitalization'] for share in shares])
+
+    bot.send_message(message.from_user.id, f'Стоимость твоего портфеля на данный момент = {total_price}₽')
+
+
+@bot.message_handler(func=lambda message: True, commands=['my_tickers'])
+def my_tickers_command(message):
+    shares = get_user_shares(message.from_user.id)
+
+    response = '\n'.join([f'{share["ticker"]} - {share["amount"]} - {share["users_capitalization"]}₽'
+                          for share in shares])
+
+    bot.send_message(message.from_user.id, f'Список твоих тикеров:\n{response}\n'
+                                           f'Добавить новый можно командой /add\n'
+                                           f'Удалить можно командой /delete')
+
+
+@bot.message_handler(func=lambda message: True, commands=['ticker_list'])
+def ticker_list_command(message):
+    send_ticker_list(message.from_user.id, message.text)
+
+
 def dialog_function_wrapper(error_message, allowed_commands=None):
     if allowed_commands is None:
         allowed_commands = []
 
     def outer(func):
         def wrapper(message, *args, **kwargs):
-            if message.text.startswith('/cancel'):
+            if message.content_type != 'text':
+                msg = bot.send_message(message.from_user.id, bot_messages.not_text_error)
+                if args:
+                    bot.register_next_step_handler(msg, wrapper, *args)
+                else:
+                    bot.register_next_step_handler(msg, wrapper)
+                return
+            elif message.text.startswith('/cancel'):
                 return
             elif message.text in allowed_commands:
                 bot.process_new_messages([message])
@@ -116,25 +137,21 @@ def get_user_shares(user_id, change=False):
     return shares
 
 
-@bot.message_handler(func=lambda message: True, commands=['my_investment_portfolio'])
-def my_investment_portfolio_command(message):
-    shares = get_user_shares(message.from_user.id)
+def notify_users():
+    for user in User.objects.all():
+        shares = get_user_shares(user['user_id'], change=True)
 
-    total_price = sum([share['users_capitalization'] for share in shares])
+        if not len(shares):
+            continue
 
-    bot.send_message(message.from_user.id, f'Стоимость твоего портфеля на данный момент = {total_price}₽')
+        total_change = sum([share['change'] for share in shares])
 
+        if total_change < 0:
+            response = f'Изменение стоимости активов: {total_change}'
+        else:
+            response = f'Изменение стоимости активов: +{total_change}'
 
-@bot.message_handler(func=lambda message: True, commands=['my_tickers'])
-def my_tickers_command(message):
-    shares = get_user_shares(message.from_user.id)
-
-    response = '\n'.join([f'{share["ticker"]} - {share["amount"]} - {share["users_capitalization"]}₽'
-                          for share in shares])
-
-    bot.send_message(message.from_user.id, f'Список твоих тикеров:\n{response}\n'
-                                           f'Добавить новый можно командой /add\n'
-                                           f'Удалить можно командой /delete')
+        bot.send_message(user['user_id'], response)
 
 
 # detail dialog
@@ -317,11 +334,6 @@ def send_ticker_list(user_id, message_text, page=1):
                      reply_markup=markup)
 
 
-@bot.message_handler(func=lambda message: True, commands=['ticker_list'])
-def ticker_list_command(message):
-    send_ticker_list(message.from_user.id, message.text)
-
-
 @bot.callback_query_handler(func=lambda call: True)
 def callback_worker(call):
     if call.data.startswith('ticker_list_prev_page') or call.data.startswith('ticker_list_next_page'):
@@ -329,12 +341,72 @@ def callback_worker(call):
         bot.answer_callback_query(call.id)
 
 
-@bot.message_handler(func=lambda message: True, commands=['help'])
-def help_command(message):
-    bot.send_message(message.from_user.id, bot_messages.help_command)
-
-
 @bot.message_handler(content_types=['text'])
 def message_handler(message):
     if message.text.startswith('/'):
         bot.send_message(message.from_user.id, 'Нет такой команды')
+
+
+@bot.message_handler(content_types=['document'])
+def document_handler(message):
+    try:
+        if message.document.mime_type != 'text/csv':
+            raise Exception()
+
+        file_info = bot.get_file(message.document.file_id)
+        file = bot.download_file(file_info.file_path)
+
+        text = file.decode()
+    except Exception as e:
+        print(e)
+        bot.send_message(message.from_user.id, bot_messages.document_read_error)
+        bot.register_next_step_handler(message, document_handler)
+        return
+
+    tickers = Exchange.get_tickers()
+
+    errors_caused_by_ticker = []
+    errors_caused_by_amount = []
+    succeed_tickers = []
+
+    for row in text.split('\n'):
+        try:
+            ticker, amount = row.split(',')[:2]
+        except ValueError:
+            continue
+
+        ticker = ticker.upper()
+
+        if ticker not in tickers:
+            errors_caused_by_ticker.append(ticker)
+            continue
+
+        if not isint(amount):
+            errors_caused_by_amount.append((ticker, amount))
+            continue
+
+        succeed_tickers.append((ticker, amount))
+
+    response_message = bot_messages.document_file_processed
+
+    if len(succeed_tickers):
+        user = User.objects.get(message.from_user.id)
+        response_message += bot_messages.document_tickers_added
+
+        for ticker, amount in succeed_tickers:
+            user.add_ticker(ticker, int(amount))
+            response_message += f'{ticker} в количестве {amount}\n'
+
+    if len(errors_caused_by_ticker):
+        response_message += bot_messages.document_ticker_error
+
+        for ticker in errors_caused_by_ticker:
+            response_message += f'{ticker}\n'
+
+    if len(errors_caused_by_amount):
+        response_message += bot_messages.document_amount_error
+
+        for ticker, amount in errors_caused_by_amount:
+            response_message += f'{ticker}: {amount}\n'
+
+    bot.send_message(message.from_user.id, response_message)
